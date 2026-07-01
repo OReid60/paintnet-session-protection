@@ -1,3 +1,6 @@
+Download
+https://github.com/OReid60/paintnet-session-protection/releases/download/v1/Paint.NET.Session.Protection.exe
+
 # Paint.NET Session Protection
 
 A standalone Windows utility that periodically sends a configurable save hotkey to Paint.NET while Paint.NET is the foreground application. When the selected `.pdn` file changes, it creates a timestamped recovery copy.
