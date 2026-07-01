@@ -21,9 +21,14 @@ except ImportError:
 
 
 APP_NAME = "Paint.NET Session Protection"
+APP_VERSION = "2.0.0"
 APP_DIR = Path(os.getenv("APPDATA", Path.home())) / "PaintNET Session Protection"
 CONFIG_PATH = APP_DIR / "settings.json"
 CHECK_INTERVAL_MS = 1000
+IDLE_BEFORE_SAVE_MS = 2000
+SAVE_POLL_MS = 250
+SAVE_STABLE_MS = 1000
+SAVE_TIMEOUT_MS = 15000
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
@@ -34,14 +39,17 @@ class SessionProtectionApp:
         self.last_hotkey_at = None
         self.last_file_mtime = None
         self.pending_snapshot = False
+        self.save_wait_started_at = None
+        self.save_observed_state = None
+        self.save_stable_since = None
         self.tray_icon = None
         self.quitting = False
         self.settings = self.load_settings()
 
         self.document_var = tk.StringVar(value=self.settings.get("document", ""))
         self.interval_var = tk.IntVar(value=self.settings.get("interval", 5))
-        self.hotkey_var = tk.StringVar(value=self.settings.get("hotkey", "Ctrl+S"))
         self.retention_var = tk.IntVar(value=self.settings.get("retention", 20))
+        self.versions_folder_var = tk.StringVar(value=self.settings.get("versions_folder", "Paint.NET Versions"))
         self.status_var = tk.StringVar(value="Protection disabled")
         self.startup_var = tk.BooleanVar(value=self.is_startup_enabled())
 
@@ -56,7 +64,7 @@ class SessionProtectionApp:
             self.root.after(100, self.toggle)
 
     def configure_window(self):
-        self.root.title(APP_NAME)
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
         self.root.geometry("900x570")
         self.root.minsize(780, 520)
         self.root.configure(bg="#1e1f22")
@@ -74,7 +82,7 @@ class SessionProtectionApp:
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
         ctk.CTkLabel(sidebar, text="PAINT.NET", font=("Segoe UI", 16, "bold"), text_color="#f2f3f5").pack(anchor="w", padx=18, pady=(18, 0))
-        ctk.CTkLabel(sidebar, text="SESSION PROTECTION", font=("Segoe UI", 9, "bold"), text_color="#b5bac1").pack(anchor="w", padx=18, pady=(0, 20))
+        ctk.CTkLabel(sidebar, text=f"SESSION PROTECTION  •  v{APP_VERSION}", font=("Segoe UI", 9, "bold"), text_color="#b5bac1").pack(anchor="w", padx=18, pady=(0, 20))
         ctk.CTkLabel(sidebar, text="#   protection", anchor="w", height=40, corner_radius=10, fg_color="#404249", font=("Segoe UI", 11, "bold")).pack(fill="x", padx=10)
         ctk.CTkLabel(sidebar, text="#   recovery-versions", anchor="w", height=40, text_color="#b5bac1").pack(fill="x", padx=18, pady=(3, 0))
         ctk.CTkLabel(sidebar, text="Protection only runs while\nPaint.NET is in the foreground.", text_color="#949ba4", justify="left").pack(side="bottom", anchor="w", padx=18, pady=18)
@@ -93,17 +101,19 @@ class SessionProtectionApp:
         ctk.CTkButton(card, text="Browse", command=self.choose_document, height=38, corner_radius=10, fg_color="#4e5058", hover_color="#6d6f78").grid(row=2, column=2, sticky="ew", padx=(0, 22), pady=(5, 3))
         ctk.CTkLabel(card, text="Choose the .pdn file you want to protect.", text_color="#949ba4").grid(row=3, column=0, columnspan=3, sticky="w", padx=22, pady=(0, 14))
         label(card, "SAVE INTERVAL").grid(row=4, column=0, sticky="w", padx=(22, 0))
-        label(card, "SAVE HOTKEY").grid(row=4, column=1, sticky="w", padx=(16, 0))
+        label(card, "SAVE COMMAND").grid(row=4, column=1, sticky="w", padx=(16, 0))
         label(card, "VERSIONS TO KEEP").grid(row=4, column=2, sticky="w", padx=(16, 22))
         ctk.CTkEntry(card, textvariable=self.interval_var, height=38, corner_radius=10, border_width=0, fg_color="#1e1f22").grid(row=5, column=0, sticky="ew", padx=(22, 0), pady=(5, 16))
-        ctk.CTkEntry(card, textvariable=self.hotkey_var, height=38, corner_radius=10, border_width=0, fg_color="#1e1f22").grid(row=5, column=1, sticky="ew", padx=(16, 0), pady=(5, 16))
+        ctk.CTkLabel(card, text="Ctrl+S", height=38, corner_radius=10, fg_color="#232428", anchor="w", padx=12, text_color="#949ba4").grid(row=5, column=1, sticky="ew", padx=(16, 0), pady=(5, 16))
         ctk.CTkEntry(card, textvariable=self.retention_var, height=38, corner_radius=10, border_width=0, fg_color="#1e1f22").grid(row=5, column=2, sticky="ew", padx=(16, 22), pady=(5, 16))
-        ctk.CTkLabel(card, textvariable=self.status_var, height=44, corner_radius=10, fg_color="#232428", anchor="w", padx=14, font=("Segoe UI", 11, "bold")).grid(row=6, column=0, columnspan=2, sticky="ew", padx=(22, 8), pady=(2, 14))
+        label(card, "RECOVERY FOLDER NAME").grid(row=6, column=0, columnspan=3, sticky="w", padx=22)
+        ctk.CTkEntry(card, textvariable=self.versions_folder_var, height=38, corner_radius=10, border_width=0, fg_color="#1e1f22", placeholder_text="Paint.NET Versions").grid(row=7, column=0, columnspan=3, sticky="ew", padx=22, pady=(5, 16))
+        ctk.CTkLabel(card, textvariable=self.status_var, height=44, corner_radius=10, fg_color="#232428", anchor="w", padx=14, font=("Segoe UI", 11, "bold")).grid(row=8, column=0, columnspan=2, sticky="ew", padx=(22, 8), pady=(2, 14))
         self.toggle_button = ctk.CTkButton(card, text="Enable Protection", command=self.toggle, height=44, corner_radius=12, fg_color="#5865f2", hover_color="#4752c4", font=("Segoe UI", 11, "bold"))
-        self.toggle_button.grid(row=6, column=2, sticky="ew", padx=(8, 22), pady=(2, 14))
-        ctk.CTkButton(card, text="Open Recovery Versions", command=self.open_versions, height=42, corner_radius=12, fg_color="#4e5058", hover_color="#6d6f78", font=("Segoe UI", 11, "bold")).grid(row=7, column=0, columnspan=3, sticky="ew", padx=22, pady=(0, 20))
+        self.toggle_button.grid(row=8, column=2, sticky="ew", padx=(8, 22), pady=(2, 14))
+        ctk.CTkButton(card, text="Open Recovery Folder", command=self.open_versions, height=42, corner_radius=12, fg_color="#4e5058", hover_color="#6d6f78", font=("Segoe UI", 11, "bold")).grid(row=9, column=0, columnspan=3, sticky="ew", padx=22, pady=(0, 20))
         startup = ctk.CTkFrame(card, fg_color="transparent")
-        startup.grid(row=8, column=0, columnspan=3, sticky="ew", padx=22, pady=(0, 18))
+        startup.grid(row=10, column=0, columnspan=3, sticky="ew", padx=22, pady=(0, 18))
         ctk.CTkSwitch(startup, text="Start with Windows", variable=self.startup_var, command=self.toggle_startup, progress_color="#5865f2", button_color="#ffffff", button_hover_color="#dbdee1", font=("Segoe UI", 11, "bold")).pack(side="left")
         ctk.CTkLabel(startup, text="Launches quietly in the system tray", text_color="#949ba4").pack(side="right")
         ctk.CTkLabel(content, text="Save a new artwork once as .pdn before enabling protection.", text_color="#949ba4").pack(anchor="w", padx=30, pady=(10, 14))
@@ -124,7 +134,7 @@ class SessionProtectionApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.quit_app),
         )
-        self.tray_icon = pystray.Icon("paintnet_session_protection", image, APP_NAME, menu)
+        self.tray_icon = pystray.Icon("paintnet_session_protection", image, f"{APP_NAME} v{APP_VERSION}", menu)
         self.tray_icon.run_detached()
 
     def hide_to_tray(self):
@@ -194,6 +204,7 @@ class SessionProtectionApp:
     def toggle(self):
         if self.enabled:
             self.enabled = False
+            self.pending_snapshot = False
             self.status_var.set("Protection disabled")
             self.toggle_button.configure(text="Enable Protection", fg_color="#5865f2", hover_color="#4752c4")
             self.save_settings()
@@ -205,7 +216,7 @@ class SessionProtectionApp:
             retention = int(self.retention_var.get())
             if interval < 1 or retention < 1:
                 raise ValueError("Interval and retention must be at least 1.")
-            self.parse_hotkey(self.hotkey_var.get())
+            self.recovery_folder(document)
         except (ValueError, tk.TclError) as error:
             messagebox.showwarning("Invalid settings", str(error), parent=self.root)
             return
@@ -223,35 +234,69 @@ class SessionProtectionApp:
                 now = datetime.now()
                 interval_seconds = max(1, int(self.interval_var.get())) * 60
                 due = self.last_hotkey_at is None or (now - self.last_hotkey_at).total_seconds() >= interval_seconds
-                if due and self.is_paintnet_foreground():
+                if (due and not self.pending_snapshot and self.is_paintnet_foreground()
+                        and self.user_idle_ms() >= IDLE_BEFORE_SAVE_MS
+                        and not self.paintnet_has_dialog()):
                     self.send_hotkey()
                     self.last_hotkey_at = now
                     self.pending_snapshot = True
+                    self.save_wait_started_at = now
+                    document = Path(self.document_var.get())
+                    stat = document.stat()
+                    self.save_observed_state = (stat.st_mtime_ns, stat.st_size)
+                    self.save_stable_since = None
                     self.status_var.set("Save requested — checking for file changes")
                     self.notify_windows(
                         "Timed save requested",
-                        f"{self.hotkey_var.get()} was sent to Paint.NET at {now:%I:%M %p}.",
+                        f"Ctrl+S was sent to Paint.NET at {now:%I:%M %p}.",
                     )
-                    self.root.after(2000, self.snapshot_if_changed)
+                    self.root.after(SAVE_POLL_MS, self.wait_for_saved_file)
             except Exception as error:
                 self.status_var.set(f"Protection error: {error}")
         self.root.after(CHECK_INTERVAL_MS, self.monitor)
 
-    def snapshot_if_changed(self):
-        self.pending_snapshot = False
-        if not self.enabled:
+    def wait_for_saved_file(self):
+        if not self.enabled or not self.pending_snapshot:
+            self.pending_snapshot = False
             return
         document = Path(self.document_var.get())
         if not document.is_file():
+            self.pending_snapshot = False
             self.status_var.set("Selected document is no longer available")
             return
-        current_mtime = document.stat().st_mtime
-        if self.last_file_mtime is not None and current_mtime <= self.last_file_mtime:
-            self.status_var.set("No new saved changes detected")
+        now = datetime.now()
+        if (now - self.save_wait_started_at).total_seconds() * 1000 >= SAVE_TIMEOUT_MS:
+            self.pending_snapshot = False
+            self.status_var.set("No completed file change detected after Ctrl+S")
             return
 
-        self.last_file_mtime = current_mtime
-        versions = document.parent / "Paint.NET Versions"
+        stat = document.stat()
+        state = (stat.st_mtime_ns, stat.st_size)
+        if self.last_file_mtime is not None and stat.st_mtime <= self.last_file_mtime:
+            self.root.after(SAVE_POLL_MS, self.wait_for_saved_file)
+            return
+        if state != self.save_observed_state:
+            self.save_observed_state = state
+            self.save_stable_since = now
+            self.root.after(SAVE_POLL_MS, self.wait_for_saved_file)
+            return
+        if self.save_stable_since is None:
+            self.save_stable_since = now
+            self.root.after(SAVE_POLL_MS, self.wait_for_saved_file)
+            return
+        if (now - self.save_stable_since).total_seconds() * 1000 < SAVE_STABLE_MS:
+            self.root.after(SAVE_POLL_MS, self.wait_for_saved_file)
+            return
+        try:
+            with document.open("rb"):
+                pass
+        except OSError:
+            self.root.after(SAVE_POLL_MS, self.wait_for_saved_file)
+            return
+
+        self.pending_snapshot = False
+        self.last_file_mtime = stat.st_mtime
+        versions = self.recovery_folder(document)
         versions.mkdir(exist_ok=True)
         target = versions / f"{document.stem}_{datetime.now():%Y-%m-%d_%H-%M-%S}{document.suffix}"
         shutil.copy2(document, target)
@@ -296,9 +341,25 @@ class SessionProtectionApp:
         except ValueError as error:
             messagebox.showwarning("Document required", str(error), parent=self.root)
             return
-        versions = document.parent / "Paint.NET Versions"
+        try:
+            versions = self.recovery_folder(document)
+        except ValueError as error:
+            messagebox.showwarning("Invalid folder name", str(error), parent=self.root)
+            return
         versions.mkdir(exist_ok=True)
         os.startfile(versions)
+
+    def recovery_folder(self, document):
+        name = self.versions_folder_var.get().strip()
+        invalid_characters = '<>:"/\\|?*'
+        reserved_names = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+        if not name:
+            raise ValueError("Enter a recovery folder name.")
+        if name in {".", ".."} or any(character in name for character in invalid_characters):
+            raise ValueError("The recovery folder name contains characters Windows does not allow.")
+        if name.endswith((".", " ")) or name.split(".")[0].upper() in reserved_names:
+            raise ValueError("Enter a valid Windows folder name.")
+        return document.parent / name
 
     def validated_document(self):
         document = Path(self.document_var.get().strip())
@@ -306,37 +367,57 @@ class SessionProtectionApp:
             raise ValueError("Select an existing .pdn document first.")
         return document
 
-    @staticmethod
-    def parse_hotkey(text):
-        parts = [part.strip().lower() for part in text.split("+") if part.strip()]
-        modifiers = {"ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B, "windows": 0x5B}
-        if not parts:
-            raise ValueError("Enter a hotkey such as Ctrl+S.")
-        modifier_codes = []
-        for part in parts[:-1]:
-            if part not in modifiers:
-                raise ValueError("Supported modifiers: Ctrl, Alt, Shift, and Win.")
-            modifier_codes.append(modifiers[part])
-        key = parts[-1]
-        if len(key) == 1 and key.isalnum():
-            key_code = ord(key.upper())
-        elif key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 12:
-            key_code = 0x6F + int(key[1:])
-        else:
-            raise ValueError("Use a letter, number, or F1-F12 as the final key.")
-        return modifier_codes, key_code
-
     def send_hotkey(self):
-        modifiers, key_code = self.parse_hotkey(self.hotkey_var.get())
-        for modifier in modifiers:
-            ctypes.windll.user32.keybd_event(modifier, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(key_code, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(key_code, 0, 0x0002, 0)
-        for modifier in reversed(modifiers):
-            ctypes.windll.user32.keybd_event(modifier, 0, 0x0002, 0)
+        ctrl_key = 0x11
+        s_key = ord("S")
+        ctypes.windll.user32.keybd_event(ctrl_key, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(s_key, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(s_key, 0, 0x0002, 0)
+        ctypes.windll.user32.keybd_event(ctrl_key, 0, 0x0002, 0)
+
+    @staticmethod
+    def user_idle_ms():
+        class LastInputInfo(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+        info = LastInputInfo()
+        info.cbSize = ctypes.sizeof(info)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return 0
+        return (ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+
+    @staticmethod
+    def paintnet_has_dialog():
+        ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
+        ctypes.windll.user32.GetWindow.restype = ctypes.c_void_p
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        foreground_class = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, foreground_class, len(foreground_class))
+        if foreground_class.value == "#32770":
+            return True
+        thread_id = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, None)
+        found_dialog = ctypes.c_bool(False)
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def inspect_window(window, _parameter):
+            if window != hwnd and ctypes.windll.user32.IsWindowVisible(window):
+                class_name = ctypes.create_unicode_buffer(256)
+                ctypes.windll.user32.GetClassNameW(window, class_name, len(class_name))
+                if class_name.value == "#32770":
+                    found_dialog.value = True
+                    return False
+            return True
+
+        ctypes.windll.user32.EnumThreadWindows(thread_id, callback_type(inspect_window), 0)
+        enabled_popup = ctypes.windll.user32.GetWindow(hwnd, 6)  # GW_ENABLEDPOPUP
+        popup_visible = enabled_popup and enabled_popup != hwnd and ctypes.windll.user32.IsWindowVisible(enabled_popup)
+        return found_dialog.value or bool(popup_visible)
 
     @staticmethod
     def is_paintnet_foreground():
+        ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
         hwnd = ctypes.windll.user32.GetForegroundWindow()
         process_id = ctypes.c_ulong()
         ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
@@ -346,7 +427,7 @@ class SessionProtectionApp:
                 buffer = ctypes.create_unicode_buffer(32768)
                 length = ctypes.c_ulong(len(buffer))
                 if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(length)):
-                    return Path(buffer.value).name.lower() in {"paintdotnet.exe", "paint.net.exe"}
+                    return Path(buffer.value).name.lower() == "paintdotnet.exe"
             finally:
                 ctypes.windll.kernel32.CloseHandle(handle)
         return False
@@ -362,8 +443,8 @@ class SessionProtectionApp:
         settings = {
             "document": self.document_var.get(),
             "interval": self.interval_var.get(),
-            "hotkey": self.hotkey_var.get(),
             "retention": self.retention_var.get(),
+            "versions_folder": self.versions_folder_var.get().strip(),
             "protection_enabled": self.enabled,
         }
         CONFIG_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
