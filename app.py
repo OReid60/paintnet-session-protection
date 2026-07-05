@@ -21,7 +21,7 @@ except ImportError:
 
 
 APP_NAME = "Paint.NET Session Protection"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 APP_DIR = Path(os.getenv("APPDATA", Path.home())) / "PaintNET Session Protection"
 CONFIG_PATH = APP_DIR / "settings.json"
 CHECK_INTERVAL_MS = 1000
@@ -388,32 +388,52 @@ class SessionProtectionApp:
 
     @staticmethod
     def paintnet_has_dialog():
-        ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
-        ctypes.windll.user32.GetWindow.restype = ctypes.c_void_p
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
-        if not hwnd:
-            return False
-        foreground_class = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetClassNameW(hwnd, foreground_class, len(foreground_class))
-        if foreground_class.value == "#32770":
+        """Return True unless Paint.NET has only its normal top-level windows.
+
+        Paint.NET normally has one ownerless main window and as many as four
+        top-level palette windows (Tools, History, Layers, and Colors) owned by
+        that main window. A modal dialog disables the main window; any other
+        ownership layout is also treated as a dialog so the save fails safe.
+        """
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetWindow.restype = ctypes.c_void_p
+        foreground = user32.GetForegroundWindow()
+        if not foreground:
             return True
-        thread_id = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, None)
-        found_dialog = ctypes.c_bool(False)
+
+        process_id = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(foreground, ctypes.byref(process_id))
+        if not process_id.value:
+            return True
+
+        windows = []
         callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
         def inspect_window(window, _parameter):
-            if window != hwnd and ctypes.windll.user32.IsWindowVisible(window):
-                class_name = ctypes.create_unicode_buffer(256)
-                ctypes.windll.user32.GetClassNameW(window, class_name, len(class_name))
-                if class_name.value == "#32770":
-                    found_dialog.value = True
-                    return False
+            window_process_id = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(window, ctypes.byref(window_process_id))
+            if window_process_id.value == process_id.value and user32.IsWindowVisible(window):
+                windows.append(window)
             return True
 
-        ctypes.windll.user32.EnumThreadWindows(thread_id, callback_type(inspect_window), 0)
-        enabled_popup = ctypes.windll.user32.GetWindow(hwnd, 6)  # GW_ENABLEDPOPUP
-        popup_visible = enabled_popup and enabled_popup != hwnd and ctypes.windll.user32.IsWindowVisible(enabled_popup)
-        return found_dialog.value or bool(popup_visible)
+        callback = callback_type(inspect_window)
+        user32.EnumWindows(callback, 0)
+
+        GW_OWNER = 4
+        ownerless = [window for window in windows if not user32.GetWindow(window, GW_OWNER)]
+        if len(ownerless) != 1:
+            return True
+
+        main_window = ownerless[0]
+        if not user32.IsWindowEnabled(main_window):
+            return True
+
+        owned_windows = [window for window in windows if window != main_window]
+        if len(owned_windows) > 4:
+            return True
+
+        return any(user32.GetWindow(window, GW_OWNER) != main_window for window in owned_windows)
 
     @staticmethod
     def is_paintnet_foreground():
